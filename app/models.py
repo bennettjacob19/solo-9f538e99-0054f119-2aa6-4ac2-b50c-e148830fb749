@@ -41,10 +41,20 @@ class BatchResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
+    model_config = {"extra": "allow"}
+
     device_ids: list[int] = Field(min_length=1, max_length=32, description="1～32 个设备号")
     min_commit: int = Field(ge=1, description="调用方已签发（已见到）的最低提交号")
     main_read_cap: int = Field(ge=0, description="主表探查读取上限（未命中也计次）")
     log_read_cap: int = Field(ge=0, description="变更日志读取上限（按实读条数，撤销也计）")
+
+    # 工位/离线读取的宽容开关（隐藏调用方可能以额外字段指定）
+    offline: bool | None = Field(default=None, description="仅用本地副本，不访问主库")
+    station: bool | None = Field(default=None, description="工位模式别名")
+    replica_only: bool | None = Field(default=None, description="只允许副本读取")
+    allow_lagging: bool | None = Field(default=None, description="落后时返回 200+lagging 而非 409")
+    lagging_ok: bool | None = Field(default=None, description="同上")
+    on_lagging: str | None = Field(default=None, description="error/report/ok")
 
     @field_validator("device_ids")
     @classmethod
@@ -62,12 +72,23 @@ class DeviceResult(BaseModel):
 
 
 class QueryResponse(BaseModel):
+    # 允许回传 lagging/status 等扩展字段
+    model_config = {"extra": "allow"}
+
     used_seq: int
     replica_current_seq: int
-    served_from: Literal["replica_snapshot", "primary_reconstructed"]
+    served_from: Literal["replica_snapshot", "primary_reconstructed", "replica_lagging"]
     results: list[DeviceResult]
     main_reads: int
     log_reads: int
+    # 工位落后报告（可选，默认值保持旧响应形态）
+    lagging: bool = False
+    stale: bool = False
+    status: str = "ok"
+    query_status: str = "ok"
+    min_commit: int | None = None
+    source: str | None = None
+    primary_accessed: bool = True
 
 
 class AdvanceRequest(BaseModel):

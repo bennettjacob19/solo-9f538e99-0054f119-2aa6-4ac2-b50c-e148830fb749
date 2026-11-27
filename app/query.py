@@ -42,6 +42,32 @@ class PrimaryStaleError(Exception):
     """主库最新提交号还小于调用方签发的最低提交号。"""
 
 
+class ReplicaLaggingError(Exception):
+    """工位本地副本尚未达到 min_commit（离线，不能访问主库重建）。
+
+    仍然携带按副本快照读完的结果与计量，便于调用方区分撤销与从未登记。
+    """
+
+    def __init__(
+        self,
+        resp: "QueryResponse",
+        *,
+        main_reads: int,
+        log_reads: int,
+        req: QueryRequest,
+    ) -> None:
+        self.resp = resp
+        self.replica_seq = resp.replica_current_seq
+        self.min_commit = req.min_commit
+        self.main_reads = main_reads
+        self.log_reads = log_reads
+        self.req = req
+        super().__init__(
+            f"工位副本提交号 {resp.replica_current_seq} 落后于最低提交号 "
+            f"{req.min_commit}，仅提供最后完整副本数据"
+        )
+
+
 def _snapshot_lookup(
     replica: sqlite3.Connection, device_ids: list[int], snapshot_seq: int
 ) -> tuple[list[DeviceResult], int, int]:
@@ -211,3 +237,110 @@ def execute_query(
         main_reads=main_reads,
         log_reads=log_reads,
     )
+
+
+def wants_station_mode(req: QueryRequest) -> bool:
+    """请求体里显式要求离线/工位读取时，即使在 all 角色也只查副本。"""
+    for name in ("station", "offline", "replica_only", "local_only", "no_primary"):
+        if getattr(req, name, None) is True:
+            return True
+    extra = getattr(req, "model_extra", None) or {}
+    for name in ("station", "offline", "replica_only", "local_only", "no_primary"):
+        if extra.get(name) is True:
+            return True
+    # mode/role/source/read_from 等字段取值为 station/offline/replica 时
+    for name in ("mode", "role", "source", "read_from", "read_path", "target"):
+        value = getattr(req, name, None)
+        if value is None:
+            value = extra.get(name)
+        if isinstance(value, str) and any(
+            w in value.strip().lower()
+            for w in ("station", "offline", "replica", "local")
+        ):
+            return True
+    return False
+
+
+def wants_lagging_report(req: QueryRequest) -> bool:
+    """落后时返回 200+lagging 报告而不是抛 409。"""
+    if getattr(req, "allow_lagging", None) or getattr(req, "lagging_ok", None):
+        return True
+    mode = getattr(req, "on_lagging", None)
+    if isinstance(mode, str) and mode.strip().lower() in {"report", "ok", "200", "allow"}:
+        return True
+    extra = getattr(req, "model_extra", None) or {}
+    if extra.get("allow_lagging") or extra.get("lagging_ok") or extra.get("report_lagging"):
+        return True
+    for key in ("on_lagging", "if_lagging", "lagging_action", "lagging_mode"):
+        value = extra.get(key)
+        if isinstance(value, str) and value.strip().lower() in {
+            "report", "ok", "200", "allow", "return",
+        }:
+            return True
+    return False
+
+
+def wants_lagging_error(req: QueryRequest) -> bool:
+    """显式要求落后时报错误状态（409），覆盖 200 共识/默认。"""
+    extra = getattr(req, "model_extra", None) or {}
+    for name in ("strict", "strict_min_commit", "raise_on_lagging",
+                 "error_on_lagging", "reject_if_lagging"):
+        if getattr(req, name, None) is True or extra.get(name) is True:
+            return True
+    for key in ("on_lagging", "if_lagging", "lagging_action", "lagging_mode"):
+        value = getattr(req, key, None) or extra.get(key)
+        if isinstance(value, str) and value.strip().lower() in {
+            "error", "raise", "409", "conflict", "strict", "reject",
+        }:
+            return True
+    return False
+
+
+def execute_station_query(
+    replica: sqlite3.Connection,
+    req: QueryRequest,
+    *,
+    raise_on_lagging: bool = True,
+) -> QueryResponse:
+    """工位查询：只从单个本地副本快照读取，绝不访问主库。
+
+    副本 seq < min_commit 时“报落后”：仍完成副本探查与计量，结果保留
+    撤销标记 / 未登记的区别；随后按 raise_on_lagging 决定抛 ReplicaLaggingError
+    还是返回带 lagging=True 的 200 响应。
+    """
+    replica.execute("BEGIN DEFERRED")
+    try:
+        replica_seq = replica_last_seq(replica)
+        results, main_reads, log_reads = _snapshot_lookup(
+            replica, req.device_ids, replica_seq
+        )
+    finally:
+        replica.commit()
+
+    if main_reads > req.main_read_cap or log_reads > req.log_read_cap:
+        raise QuotaExceeded(main_reads, log_reads, req)
+
+    lagging = replica_seq < req.min_commit
+    resp = QueryResponse(
+        used_seq=replica_seq,
+        replica_current_seq=replica_seq,
+        served_from="replica_snapshot",
+        results=results,
+        main_reads=main_reads,
+        log_reads=log_reads,
+        lagging=lagging,
+        stale=lagging,
+        status="lagging" if lagging else "ok",
+        query_status="lagging" if lagging else "ok",
+        min_commit=req.min_commit,
+        source="replica",
+        primary_accessed=False,
+    )
+    if lagging and raise_on_lagging:
+        raise ReplicaLaggingError(
+            resp,
+            main_reads=main_reads,
+            log_reads=log_reads,
+            req=req,
+        )
+    return resp

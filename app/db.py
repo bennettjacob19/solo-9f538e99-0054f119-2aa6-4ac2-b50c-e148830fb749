@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from typing import Iterator
 
 from .config import get_paths
@@ -23,6 +24,13 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
+
+_META_DDL = """
+CREATE TABLE IF NOT EXISTS site_meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
+"""
 
 _PRIMARY_DDL = """
 CREATE TABLE IF NOT EXISTS main_state (
@@ -73,8 +81,17 @@ CREATE TABLE IF NOT EXISTS replica_fault (
 
 def init_primary(db_path: str | None = None) -> sqlite3.Connection:
     db_path = db_path or get_paths().primary
+    assert db_path is not None, "当前为工位角色，未配置 PRIMARY_DB"
     conn = connect(db_path)
     conn.executescript(_PRIMARY_DDL)
+    conn.executescript(_META_DDL)
+    # 每个主库文件有一个稳定身份，交接包据此校验“来自同一主库”。
+    row = conn.execute("SELECT value FROM site_meta WHERE key = 'primary_id'").fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO site_meta (key, value) VALUES ('primary_id', ?)",
+            (str(uuid.uuid4()),),
+        )
     conn.commit()
     return conn
 
@@ -83,8 +100,22 @@ def init_replica(db_path: str | None = None) -> sqlite3.Connection:
     db_path = db_path or get_paths().replica
     conn = connect(db_path)
     conn.executescript(_REPLICA_DDL)
+    conn.executescript(_META_DDL)
     conn.commit()
     return conn
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM site_meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO site_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 def get_connections() -> Iterator[tuple[sqlite3.Connection, sqlite3.Connection]]:

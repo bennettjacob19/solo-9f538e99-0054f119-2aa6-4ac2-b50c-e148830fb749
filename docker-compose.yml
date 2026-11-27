@@ -1,4 +1,5 @@
 services:
+  # 主库节点（兼作打包端；保留原有全部接口，端口 8000）
   maintenance-api:
     build: .
     image: maintenance-replay-demo:latest
@@ -6,13 +7,37 @@ services:
     ports:
       - "8000:8000"
     environment:
+      ROLE: all
       # 主库与副本是容器卷里两个独立的 SQLite 文件
       DATA_DIR: /data
       PRIMARY_DB: /data/primary.sqlite3
       REPLICA_DB: /data/replica.sqlite3
+      MEDIA_DIR: /media
     volumes:
       - maintenance-data:/data
+      # 模拟移动介质：主库把交接包写到这里，拔下后挂到工位
+      - handoff-media:/media
+    restart: unless-stopped
+
+  # 检修工位：只有单个本地 SQLite 副本，全程不访问主库，端口 8001
+  station:
+    build: .
+    image: maintenance-replay-demo:latest
+    container_name: maintenance-station
+    ports:
+      - "8001:8000"
+    environment:
+      ROLE: station
+      DATA_DIR: /data
+      REPLICA_DB: /data/replica.sqlite3
+      MEDIA_DIR: /media
+      # 刻意不设置 PRIMARY_DB：工位不创建、不访问主库
+    volumes:
+      - station-data:/data
+      - handoff-media:/media:ro
     restart: unless-stopped
 
 volumes:
   maintenance-data:
+  station-data:
+  handoff-media:

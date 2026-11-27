@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    MEDIA_DIR=/media
 
 WORKDIR /app
 
@@ -12,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY scripts ./scripts
 
-RUN mkdir -p /data
-VOLUME ["/data"]
+RUN mkdir -p /data /media
+VOLUME ["/data", "/media"]
 
 EXPOSE 8000
 
